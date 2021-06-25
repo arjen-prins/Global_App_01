@@ -1,0 +1,188 @@
+name: Deploy to ACC - dev
+
+on:
+  push:
+    branches:
+      - dev
+
+jobs:     
+
+   # Description of jobs used in this yaml:
+   # test: Apply Remote Changes for the branch triggering the pipeline to the Test instance.
+   #       Run the Unit Test - ATF Test Suite associated with the app.  If Test Suite fails, developer gets notified. 
+   # instance-scan: Perform the instance scan on the instance defined
+   # publish: If Test Suite succeeds, Application is Published into App Repo.
+   # deploytoacc: Application is then installed into ACC instance from App Repo
+   # merge-dev-main: On successful installation, the code in dev branch is merged into main
+         #git config user.email "action@github.com" : Configure the committer email
+         #git config user.name "GitHub Action" : Configure the committer username
+         #git fetch --all : Fetch commit details from branch to be merged
+         #git checkout main : Checkout main so that we can merge the branch into it
+         #git merge dev -m "<msg>" --no-ff --allow-unrelated-histories : Merge branch with -m for commit message <msg>, 
+                                      #--no-ff for default merge not fastforward merge
+                                      # and --allow-unrelated-histories to merge unrelated branches from local and remote
+         #git push origin main : push the local merge into remote
+   # tag: The commit at this point in time is Tagged with the Application Version
+   # release_report: A release report is then generated and posted into the GIT Repo for Release Management
+   
+  test:
+    if: "contains(github.event.head_commit.message, 'Deploy to ACC')"
+    name: Basic Verification Test
+    runs-on: ubuntu-latest
+       
+    steps:
+       - name: ServiceNow CI/CD Apply Changes
+         uses: ServiceNow/sncicd-apply-changes@2.0.0
+         env:
+          nowUsername: ${{ secrets.SN_USERNAME }}
+          nowPassword: ${{ secrets.SN_PASSWORD }}
+          nowSourceInstance: ${{ secrets.SN_TEST_INSTANCE }}
+          appSysID: ${{ secrets.SN_APP_SYSID }}
+          branch: 'dev'
+
+       - name: ServiceNow CI/CD Run ATF Test Suite
+         uses: ServiceNow/sncicd-tests-run@2.0.0
+         with:
+          testSuiteSysId: ${{ secrets.SN_ATFTESTSUITE_BVT }}
+         env:
+          nowUsername: ${{ secrets.SN_USERNAME }}
+          nowPassword: ${{ secrets.SN_PASSWORD }}
+          nowInstallInstance: ${{ secrets.SN_TEST_INSTANCE }}  
+
+  instance-scan:
+    name: Instance Full Scan
+    runs-on: ubuntu-latest
+    needs: test
+    if: ${{success()}}
+    
+    steps:
+       - name: ServiceNow CI/CD Instance Scan
+         uses: ServiceNow/sncicd-instance-scan@2.0.0
+         id: scan
+         with:
+            scantype: suite_scoped # point, suite_combo, suite_scoped, suite_update
+  #          targetTable: <table_name>
+  #          targetSysId: <table_sysid>
+            #comboSysId: <combo_sys_id>
+            suiteSysId: <suite_sysid>
+            appScopeSysIds: ${{ secrets.SN_APP_SYSID }}
+            #updateSetSysIds: <update_set_sys_ids_comma_separated>
+    env:
+            nowUsername: ${{ secrets.SN_USERNAME }}
+            nowPassword: ${{ secrets.SN_PASSWORD }}
+            nowScanInstance: ${{ secrets.SN_TEST_INSTANCE }}
+    
+  publish:
+       name: Publish to App Repo 
+       runs-on: ubuntu-latest
+       needs: instance-scan  
+      
+       steps:
+       - uses: actions/checkout@v2
+       - name: ServiceNow CI/CD Publish App
+         id: publish_app   
+         uses: ServiceNow/sncicd-publish-app@2.0.1
+         with:
+          versionFormat: detect
+       env:
+            nowUsername: ${{ secrets.SN_USERNAME }}
+            nowPassword: ${{ secrets.SN_PASSWORD }}
+            nowSourceInstance: ${{ secrets.SN_TEST_INSTANCE }}
+            appSysID: ${{ secrets.SN_APP_SYSID }}
+            
+       outputs:
+        publishversion: ${{ steps.publish_app.outputs.newVersion }}
+    
+  deploytoacc:
+       name: Deploy to ACC
+       runs-on: ubuntu-latest
+       needs: publish
+       steps:      
+       - name: ServiceNow CI/CD Install App
+         continue-on-error: true
+         id: install_app
+         uses: ServiceNow/sncicd-install-app@2.0.0
+         with:
+          version: ${{ needs.publish.outputs.publishversion }}
+         env:
+          nowUsername: ${{ secrets.SN_USERNAME }}
+          nowPassword: ${{ secrets.SN_PASSWORD }}
+          nowInstallInstance: ${{ secrets.SN_ACC_INSTANCE }}
+          appSysID: ${{ secrets.SN_APP_SYSID }}
+          
+       outputs:
+        publishversion: ${{ needs.publish.outputs.publishversion }}
+        rollbackVersion: ${{steps.install_app.outputs.rollbackVersion}}    
+  
+  merge-dev-main:
+       name: Merge dev branch to main
+       runs-on: ubuntu-latest
+       needs: deploytoacc
+       if: ${{success()}}
+       steps:
+        - uses: actions/checkout@v2.3.2
+          with:
+            ref: 'dev'   #checkout the branch to be merged into main
+            fetch-depth: 0
+          
+        - name: Merge Branches 
+          run: |
+            git config user.email "action@github.com" 
+            git config user.name "GitHub Action"
+            git fetch --all
+            git checkout main
+            git merge dev -m "Application Upgraded from ${{ needs.deploytoacc.outputs.rollbackVersion }} to ${{ needs.deploytoacc.outputs.publishversion }}" --no-ff --allow-unrelated-histories
+            git push origin main
+          
+       outputs:
+            publishversion: ${{ needs.deploytoacc.outputs.publishversion }}
+            rollbackVersion: ${{needs.deploytoacc.outputs.rollbackVersion}}
+
+          
+  tag:
+       name: Tag the App Version
+       runs-on: ubuntu-latest
+       needs: merge-dev-main
+       steps:
+       - uses: actions/checkout@v2
+         with:
+          ref: 'main'
+      
+       - name: Generate Tag
+         run: |
+          git tag "${{ needs.merge-dev-main.outputs.publishversion }}"
+          git push --tags
+    
+       outputs:
+          publishversion: ${{ needs.merge-dev-main.outputs.publishversion }}
+          rollbackVersion: ${{needs.merge-dev-main.outputs.rollbackVersion}}
+
+  release_report:
+        name: Generate Release Report
+        runs-on: ubuntu-latest
+        needs: tag
+        steps:
+        - uses: actions/checkout@v2
+          with:
+            ref: 'main'
+      
+        - name: Generate report
+          run: |
+            git fetch --all --tags
+            mkdir -p ${{ github.event.repository.name }}
+            echo "Commit Message,Author (Email),Timestamp,Commit Hash" > ${{ github.event.repository.name }}/"release-${{ needs.tag.outputs.publishversion }}".csv
+            git log --format='"%s","%an (%ae)","%ci","%H"' --all "${{ needs.tag.outputs.rollbackVersion }}".."${{ needs.tag.outputs.publishversion }}" >> ${{ github.event.repository.name }}/"release-${{ needs.tag.outputs.publishversion }}".csv
+          
+            git clone https://${{ secrets.MY_GITHUB_TOKEN }}@github.com/${{ secrets.RELEASE_LOG_REPO }}
+            cd SN-Application-Release-Log
+            rsync -a ../${{ github.event.repository.name }} ./
+          
+            git config --global user.email "action@github.com"
+            git config --global user.name "GitHub Action"
+            git add .
+            git commit -m "${{ github.event.repository.name }} - ${{ needs.tag.outputs.publishversion }}"
+            git push origin main
+          
+        outputs:
+            publishversion: ${{ needs.tag.outputs.publishversion }}
+            rollbackVersion: ${{needs.tag.outputs.rollbackVersion}}
